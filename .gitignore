@@ -1,0 +1,35 @@
+# Python virtual environments & cache
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Videos and heavy media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Images & snapshots
+*.jpg
+*.jpeg
+*.png
+*.gif
+snapshots/
+debug_*.jpg
+debug_*.png
+
+# Model weights (too heavy for standard git pushes, tracked separately)
+*.pt
+*.pth
+*.onnx
+
+# System & IDE files
+.idea/
+.vscode/
+*.swp
+.DS_Store
