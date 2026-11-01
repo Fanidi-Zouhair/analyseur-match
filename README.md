@@ -24,14 +24,19 @@ An end-to-end Computer Vision pipeline for tactical football analysis. The syste
 
 ## Setup & Usage
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+### 1. Activate the Virtual Environment
+On Windows (PowerShell):
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+*(Or call `.\.venv\Scripts\python.exe` directly)*
 
-# Run analysis on a match video
+### 2. Run Analysis on a Match Video
+```bash
+# Full video processing
 python main.py --video match.mp4 --output annotated_match.mp4
 
-# Run fast validation test (e.g. 100 frames)
-python main.py --video match.mp4 --max-frames 100
+# Fast validation test (e.g. 50 frames)
+python main.py --video match.mp4 --max-frames 50
 ```
 
