@@ -18,6 +18,7 @@ from config import (
     KEYPOINT_MAX_ZONE_DIST_PX,
     KEYPOINT_PITCH_COORDS,
     ZONE_CLASSES,
+    PITCH_LENGTH,
     HALF_LINE_X,
     PITCH_CENTER_Y,
     PITCH_WIDTH,
@@ -63,6 +64,7 @@ class ZoneValidator:
         self.pitch_model = YOLO(pitch_model_path)
         self.keypoints_model = YOLO(keypoints_model_path)
         self.last_known_side: str = "left"
+        self.last_known_geometry: Optional[Dict[str, Any]] = None
 
     def process_frame(self, frame: np.ndarray) -> Tuple[List[DetectedZone], List[KeypointMatch]]:
         """
@@ -610,7 +612,7 @@ class ZoneValidator:
 
         return merged
 
-    def get_player_zone_associations(self, foot_points: np.ndarray,
+    def get_player_zone_associations(self, foot_points: Any,
                                      zones: List[DetectedZone]) -> List[List[str]]:
         """
         Tests each player foot coordinate against all detected zone masks.
@@ -625,3 +627,318 @@ class ZoneValidator:
                     inside_zones.append(z.name)
             associations.append(inside_zones)
         return associations
+
+    def get_zone_player_counts(self, foot_points: List[Tuple[float, float]],
+                               zones: List[DetectedZone]) -> Dict[str, int]:
+        """
+        Counts the number of players inside each detected pitch zone.
+        """
+        counts: Dict[str, int] = {}
+        for z in zones:
+            counts[z.name] = 0
+
+        for pt in foot_points:
+            pt_tuple = (float(pt[0]), float(pt[1]))
+            for z in zones:
+                if cv2.pointPolygonTest(z.poly, pt_tuple, False) >= 0:
+                    counts[z.name] += 1
+        return counts
+
+    def extract_reference_geometry(self, zones: List[DetectedZone],
+                                   h: int, w: int,
+                                   pitch_side: str = "left") -> Dict[str, Any]:
+        """
+        Extracts true, unclipped pitch reference lines and features from high-confidence
+        zone segmentation masks (ignoring all image borders within 15px of 0, 0, W, H).
+        """
+        halfway_line = None
+        cc_top = None
+        cc_bot = None
+        cc_spot = None
+        cl = None
+        cr = None
+
+        # 1. Halfway line & central circle features
+        # First Half Central Circle (curves left; straight diameter is on the right)
+        for z in zones:
+            if z.name == "First Half Central Circle":
+                poly = z.poly
+                unc = poly[(poly[:, 0] > 15) & (poly[:, 0] < w - 15) & (poly[:, 1] > 15) & (poly[:, 1] < h - 15)]
+                if len(unc) >= 10:
+                    p85 = np.percentile(unc[:, 0], 85)
+                    straight = unc[unc[:, 0] >= p85]
+                    if len(straight) >= 5:
+                        vx, vy, x0, y0 = cv2.fitLine(straight.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                        halfway_line = (float(vx), float(vy), float(x0), float(y0))
+                        y_top = float(straight[:, 1].min())
+                        y_bot = float(straight[:, 1].max())
+                        y_sp = (y_top + y_bot) / 2.0
+                        slope = vx / (vy if abs(vy) > 1e-4 else 1e-4)
+                        cc_top = (float(x0 + slope * (y_top - y0)), y_top)
+                        cc_bot = (float(x0 + slope * (y_bot - y0)), y_bot)
+                        cc_spot = (float(x0 + slope * (y_sp - y0)), y_sp)
+
+                    cl_idx = np.argmin(unc[:, 0])
+                    cl = (float(unc[cl_idx, 0]), float(unc[cl_idx, 1]))
+                break
+
+        # Second Half Central Circle (curves right; straight diameter is on the left)
+        for z in zones:
+            if z.name == "Second Half Central Circle":
+                poly = z.poly
+                unc = poly[(poly[:, 0] > 15) & (poly[:, 0] < w - 15) & (poly[:, 1] > 15) & (poly[:, 1] < h - 15)]
+                if len(unc) >= 10:
+                    cr_idx = np.argmax(unc[:, 0])
+                    cr = (float(unc[cr_idx, 0]), float(unc[cr_idx, 1]))
+                    if halfway_line is None:
+                        p15 = np.percentile(unc[:, 0], 15)
+                        straight = unc[unc[:, 0] <= p15]
+                        if len(straight) >= 5:
+                            vx, vy, x0, y0 = cv2.fitLine(straight.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                            halfway_line = (float(vx), float(vy), float(x0), float(y0))
+                            y_top = float(straight[:, 1].min())
+                            y_bot = float(straight[:, 1].max())
+                            y_sp = (y_top + y_bot) / 2.0
+                            slope = vx / (vy if abs(vy) > 1e-4 else 1e-4)
+                            cc_top = (float(x0 + slope * (y_top - y0)), y_top)
+                            cc_bot = (float(x0 + slope * (y_bot - y0)), y_bot)
+                            cc_spot = (float(x0 + slope * (y_sp - y0)), y_sp)
+                break
+
+        # Fallback halfway line from boundary between First Half Field & Second Half Field
+        if halfway_line is None:
+            hw_pts = self._find_halfway_line_from_fields(zones, h, w)
+            if hw_pts is not None:
+                p_top, p_bot = hw_pts
+                dx = p_bot[0] - p_top[0]
+                dy = p_bot[1] - p_top[1]
+                mag = np.hypot(dx, dy)
+                if mag > 10.0:
+                    halfway_line = (dx / mag, dy / mag, p_top[0], p_top[1])
+                    cc_top = p_top
+                    cc_bot = p_bot
+                    cc_spot = ((p_top[0] + p_bot[0]) / 2.0, (p_top[1] + p_bot[1]) / 2.0)
+
+        # 2. 18-Yard features (Infield line, apex of D-arc, top corner)
+        line_18 = None
+        arc_apex = None
+        top_18_y = None
+
+        for z in zones:
+            if z.name == "18Yard Circle":
+                poly = z.poly
+                unc = poly[(poly[:, 0] > 15) & (poly[:, 0] < w - 15) & (poly[:, 1] > 15) & (poly[:, 1] < h - 15)]
+                if len(unc) >= 10:
+                    idx = np.argmax(unc[:, 0]) if pitch_side == "left" else np.argmin(unc[:, 0])
+                    arc_apex = (float(unc[idx, 0]), float(unc[idx, 1]))
+                break
+
+        for z in zones:
+            if z.name == "18Yard":
+                poly = z.poly
+                unc = poly[(poly[:, 0] > 15) & (poly[:, 0] < w - 15) & (poly[:, 1] > 15) & (poly[:, 1] < h - 15)]
+                if len(unc) >= 10:
+                    if pitch_side == "left":
+                        p80 = np.percentile(unc[:, 0], 80)
+                        infield = unc[unc[:, 0] >= p80]
+                    else:
+                        p20 = np.percentile(unc[:, 0], 20)
+                        infield = unc[unc[:, 0] <= p20]
+                    if len(infield) >= 4:
+                        vx, vy, x0, y0 = cv2.fitLine(infield.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                        line_18 = (float(vx), float(vy), float(x0), float(y0))
+
+                    # Top horizontal edge if not touching image top border
+                    min_y_unc = unc[:, 1].min()
+                    if min_y_unc > 20.0:
+                        top_18_y = float(min_y_unc)
+                break
+
+        # 3. Far touchline (where green pitch meets advertising boards, Y = 0.0m)
+        far_touchline = None
+        field_pts = []
+        for z in zones:
+            if "Field" in z.name:
+                poly = z.poly
+                unc = poly[(poly[:, 0] > 15) & (poly[:, 0] < w - 15) & (poly[:, 1] > 15) & (poly[:, 1] < h - 15)]
+                if len(unc) > 0:
+                    field_pts.append(unc)
+
+        if field_pts:
+            all_f = np.vstack(field_pts)
+            bins = np.arange(0, w, 50)
+            top_pts = []
+            for i in range(len(bins) - 1):
+                pts_bin = all_f[(all_f[:, 0] >= bins[i]) & (all_f[:, 0] < bins[i + 1])]
+                if len(pts_bin) > 0:
+                    min_y_pt = pts_bin[np.argmin(pts_bin[:, 1])]
+                    if min_y_pt[1] > 15:  # unclipped
+                        top_pts.append(min_y_pt)
+            if len(top_pts) >= 5:
+                top_pts = np.array(top_pts)
+                vx_f, vy_f, x0_f, y0_f = cv2.fitLine(top_pts.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                far_touchline = (float(vx_f), float(vy_f), float(x0_f), float(y0_f))
+
+        # 4. Projective vertical mapping along Halfway Line
+        # Fit strictly monotonic rational curve: Y(u) = (a * u) / (1 + c * u)
+        # with u = y - y_far_h >= 0.
+        halfway_proj = None
+        if halfway_line is not None and far_touchline is not None and cc_top is not None and cc_bot is not None:
+            vx_h, vy_h, x0_h, y0_h = halfway_line
+            vx_f, vy_f, x0_f, y0_f = far_touchline
+            slope_h = vx_h / (vy_h if abs(vy_h) > 1e-4 else 1e-4)
+            slope_f = vy_f / (vx_f if abs(vx_f) > 1e-4 else 1e-4)
+
+            denom = 1.0 - slope_f * slope_h
+            if abs(denom) > 1e-4:
+                y_far_h = (y0_f + slope_f * (x0_h - slope_h * y0_h - x0_f)) / denom
+                x_far_h = x0_h + slope_h * (y_far_h - y0_h)
+
+                u_top = max(cc_top[1] - y_far_h, 1.0)
+                u_spot = max(cc_spot[1] - y_far_h, 2.0)
+                u_bot = max(cc_bot[1] - y_far_h, 3.0)
+
+                u_vals = np.array([u_top, u_spot, u_bot], dtype=np.float32)
+                Y_vals = np.array([24.85, 34.00, 43.15], dtype=np.float32)
+
+                # Linear regression on 1/Y = (1/a)*(1/u) + (c/a)
+                x_lin = 1.0 / u_vals
+                y_lin = 1.0 / Y_vals
+                poly_res = np.polyfit(x_lin, y_lin, 1)
+                m, b = poly_res[0], poly_res[1]
+
+                a = 1.0 / m if m > 0 else 0.30
+                c = b * a if b > 0 else 0.005
+                halfway_proj = (float(a), float(c), float(x_far_h), float(y_far_h))
+
+        # Merge with history if any feature was temporarily missing
+        current_geom = {
+            "pitch_side": pitch_side,
+            "halfway_line": halfway_line,
+            "cc_top": cc_top,
+            "cc_bot": cc_bot,
+            "cc_spot": cc_spot,
+            "cl": cl,
+            "cr": cr,
+            "line_18": line_18,
+            "arc_apex": arc_apex,
+            "top_18_y": top_18_y,
+            "far_touchline": far_touchline,
+            "halfway_proj": halfway_proj
+        }
+
+        if self.last_known_geometry is not None:
+            for k in ["halfway_line", "cc_top", "cc_bot", "cc_spot", "cl", "cr", "line_18", "arc_apex", "far_touchline", "halfway_proj"]:
+                if current_geom[k] is None and self.last_known_geometry.get(k) is not None:
+                    current_geom[k] = self.last_known_geometry[k]
+
+        self.last_known_geometry = current_geom
+        return current_geom
+
+    def compute_zone_relative_positions(self, foot_points: Any,
+                                        zones: List[DetectedZone],
+                                        frame_shape: Tuple[int, int]) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
+        """
+        Pipeline A: High-Reliability Zone-Relative Coordinate Interpolation.
+        Uses true unclipped reference pitch lines to compute direct (X_zone, Y_zone) metric positions
+        for each player foot contact point.
+        """
+        h, w = frame_shape[:2]
+        pitch_side = self.last_known_side
+        geom = self.extract_reference_geometry(zones, h, w, pitch_side=pitch_side)
+
+        halfway_line = geom["halfway_line"]
+        cl = geom["cl"]
+        cr = geom["cr"]
+        arc_apex = geom["arc_apex"]
+        line_18 = geom["line_18"]
+        far_touchline = geom["far_touchline"]
+        halfway_proj = geom["halfway_proj"]
+
+        # Default fallbacks if video starts without detected features
+        vx_h, vy_h, x0_h, y0_h = halfway_line if halfway_line else (0.12, -0.99, w * 0.88, h * 0.45)
+        slope_h = vx_h / (vy_h if abs(vy_h) > 1e-4 else 1e-4)
+
+        if line_18:
+            vx_18, vy_18, x0_18, y0_18 = line_18
+            slope_18 = vx_18 / (vy_18 if abs(vy_18) > 1e-4 else 1e-4)
+        else:
+            slope_18 = slope_h
+            x0_18, y0_18 = (w * 0.15, h * 0.3)
+
+        vx_f, vy_f, x0_f, y0_f = far_touchline if far_touchline else (0.99, 0.08, w * 0.5, h * 0.15)
+        slope_f = vy_f / (vx_f if abs(vx_f) > 1e-4 else 1e-4)
+
+        if halfway_proj:
+            a_proj, c_proj, x_far_h, y_far_h = halfway_proj
+        else:
+            a_proj, c_proj, x_far_h, y_far_h = (0.30, 0.005, w * 0.9, h * 0.2)
+
+        p_zones: List[Tuple[float, float]] = []
+
+        for pt in foot_points:
+            xc, yb = float(pt[0]), float(pt[1])
+
+            # ------------------------------------------------------------------
+            # 1. Y_zone: Local vertical cross-section & monotonic projective mapping
+            # ------------------------------------------------------------------
+            y_far_at_x = y0_f + slope_f * (xc - x0_f)
+            dy = yb - y_far_at_x
+            y_eff = y_far_h + dy
+            u = y_eff - y_far_h
+
+            if u >= 0:
+                Y_m = (a_proj * u) / (1.0 + c_proj * u)
+            else:
+                Y_m = a_proj * u  # slightly negative for sideline/bench
+
+            Y_m = float(np.clip(Y_m, -2.0, PITCH_WIDTH + 2.0))
+
+            # ------------------------------------------------------------------
+            # 2. X_zone: Perspective piecewise line-ratio interpolation
+            # ------------------------------------------------------------------
+            x_half = x0_h + slope_h * (yb - y0_h)
+            refs = [(x_half, 52.5)]
+
+            if cl is not None:
+                x_cl = cl[0] + slope_h * (yb - cl[1])
+                refs.append((x_cl, 43.35))
+            if cr is not None:
+                x_cr = cr[0] + slope_h * (yb - cr[1])
+                refs.append((x_cr, 61.65))
+            if arc_apex is not None:
+                x_apex = arc_apex[0] + slope_18 * (yb - arc_apex[1])
+                X_apex_m = 20.15 if pitch_side == "left" else 84.85
+                refs.append((x_apex, X_apex_m))
+            if line_18 is not None:
+                x_18 = x0_18 + slope_18 * (yb - y0_18)
+                X_18_m = 16.5 if pitch_side == "left" else 88.5
+                refs.append((x_18, X_18_m))
+
+            refs = sorted(refs, key=lambda r: r[0])
+
+            if len(refs) == 1:
+                scale = 0.05
+                X_m = 52.5 + (xc - refs[0][0]) * scale
+            elif xc <= refs[0][0]:
+                dx_px = refs[1][0] - refs[0][0]
+                dX_m = refs[1][1] - refs[0][1]
+                scale = dX_m / max(dx_px, 1e-4)
+                X_m = refs[0][1] + (xc - refs[0][0]) * scale
+            elif xc >= refs[-1][0]:
+                dx_px = refs[-1][0] - refs[-2][0]
+                dX_m = refs[-1][1] - refs[-2][1]
+                scale = dX_m / max(dx_px, 1e-4)
+                X_m = refs[-1][1] + (xc - refs[-1][0]) * scale
+            else:
+                X_m = 52.5
+                for j in range(len(refs) - 1):
+                    if refs[j][0] <= xc <= refs[j + 1][0]:
+                        t = (xc - refs[j][0]) / max(refs[j + 1][0] - refs[j][0], 1e-4)
+                        X_m = refs[j][1] + t * (refs[j + 1][1] - refs[j][1])
+                        break
+
+            X_m = float(np.clip(X_m, -2.0, PITCH_LENGTH + 2.0))
+            p_zones.append((round(X_m, 2), round(Y_m, 2)))
+
+        return p_zones, geom

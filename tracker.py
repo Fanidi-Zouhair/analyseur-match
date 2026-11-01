@@ -20,7 +20,11 @@ class TrackedObject:
     conf: float
     bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2)
     foot_pt: Tuple[float, float]             # (x_center, y_bottom)
-    pitch_pt: Optional[Tuple[float, float]] = None # (X_m, Y_m) on 2D tactical pitch
+    pitch_pt: Optional[Tuple[float, float]] = None # Final fused & smoothed (X_m, Y_m)
+    p_zone: Optional[Tuple[float, float]] = None   # Pipeline A (Zone-Relative)
+    p_kp: Optional[Tuple[float, float]] = None     # Pipeline B (Keypoint / H)
+    discrepancy: Optional[float] = None            # ||p_kp - p_zone|| in meters
+    is_fused: bool = False
     zones: List[str] = field(default_factory=list)
 
 
