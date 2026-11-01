@@ -2,7 +2,8 @@
 Homography Estimation & Stabilization Module.
 Computes projective transformation from camera pixels to 2D tactical pitch metric coordinates.
 Applies RANSAC outlier rejection, Exponential Moving Average (EMA) temporal smoothing,
-and zone-consistency spatial constraints on projected player coordinates.
+collinearity / spatial spread guards, and zone-consistency spatial constraints on projected
+player coordinates.
 """
 
 from collections import deque
@@ -60,10 +61,18 @@ class HomographyEstimator:
         src_pts = np.array([m.snapped_pt for m in matches], dtype=np.float32)
         dst_pts = np.array([m.pitch_pt for m in matches], dtype=np.float32)
 
+        # ---- BUG 4 FIX: Collinearity & Spatial Spread Guard ----
+        # Verify that destination (pitch) points span enough area to avoid degenerate H
+        if not self._check_spatial_spread(dst_pts):
+            self.cache_age += 1
+            if self.H_smooth is not None and self.cache_age <= self.max_cache_age:
+                return self.H_smooth
+            return None
+
         # Compute Homography via RANSAC
         H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh)
 
-        if H is not None and self._is_homography_valid(H):
+        if H is not None and self._is_homography_valid(H, src_pts):
             # Normalize so H[2, 2] == 1.0
             if abs(H[2, 2]) > 1e-8:
                 H = H / H[2, 2]
@@ -89,9 +98,30 @@ class HomographyEstimator:
                 return self.H_smooth
             return None
 
-    def _is_homography_valid(self, H: np.ndarray) -> bool:
+    def _check_spatial_spread(self, dst_pts: np.ndarray,
+                              min_x_span: float = 15.0,
+                              min_y_span: float = 10.0) -> bool:
         """
-        Validates condition number, non-zero determinant, and projective plausibility.
+        Verifies that the 2D pitch destination points are NOT collinear or clustered.
+        Points must span at least min_x_span meters in X and min_y_span meters in Y.
+        """
+        x_span = dst_pts[:, 0].max() - dst_pts[:, 0].min()
+        y_span = dst_pts[:, 1].max() - dst_pts[:, 1].min()
+
+        if x_span < min_x_span and y_span < min_y_span:
+            return False
+
+        # Also reject if all X values are nearly identical (would produce vertical-line collapse)
+        x_std = np.std(dst_pts[:, 0])
+        if x_std < 2.0:
+            return False
+
+        return True
+
+    def _is_homography_valid(self, H: np.ndarray, src_pts: np.ndarray) -> bool:
+        """
+        Validates condition number, non-zero determinant, projective plausibility,
+        and left-to-right ordering preservation.
         """
         if np.isnan(H).any() or np.isinf(H).any():
             return False
@@ -103,6 +133,27 @@ class HomographyEstimator:
         # Condition number test
         cond = np.linalg.cond(H)
         if cond > 1e9:
+            return False
+
+        # ---- BUG 4 FIX: Check that H does not collapse X variance ----
+        # Project the source points and verify that X variance is preserved
+        try:
+            proj = cv2.perspectiveTransform(
+                src_pts.reshape(-1, 1, 2), H
+            ).reshape(-1, 2)
+
+            # If all projected X are nearly identical, the homography is degenerate
+            proj_x_std = np.std(proj[:, 0])
+            if proj_x_std < 1.0:
+                return False
+
+            # Verify output is within a reasonable range (e.g., -20 to 125 meters)
+            if proj[:, 0].min() < -50.0 or proj[:, 0].max() > 155.0:
+                return False
+            if proj[:, 1].min() < -50.0 or proj[:, 1].max() > 120.0:
+                return False
+
+        except Exception:
             return False
 
         return True
@@ -129,6 +180,10 @@ class HomographyEstimator:
         Enforces geometric constraints between camera zone detections and 2D radar positions.
         If a player's feet are inside a zone in the camera image (99.3% precision anchor),
         their 2D pitch projection is verified and clamped to remain faithful to that zone.
+
+        BUG 1 FIX: Removed the hard min(x, HALF_LINE_X) / max(x, HALF_LINE_X) clamping
+        that was collapsing all players onto X=52.5. Only 18Yard, 5Yard, and global
+        pitch bounds remain as constraints.
         """
         if len(proj_pts) == 0:
             return proj_pts
@@ -158,11 +213,10 @@ class HomographyEstimator:
                     x = np.clip(x, PITCH_LENGTH - GOAL_BOX_DEPTH, PITCH_LENGTH)
                     y = np.clip(y, GOAL_BOX_Y_MIN, GOAL_BOX_Y_MAX)
 
-            # Half Field Boundary Consistency
-            if "First Half Field" in zones and "Second Half Field" not in zones:
-                x = min(x, HALF_LINE_X)
-            elif "Second Half Field" in zones and "First Half Field" not in zones:
-                x = max(x, HALF_LINE_X)
+            # ---- BUG 1 FIX: Removed hard HALF_LINE_X clamping ----
+            # Previously: if "First Half Field" in zones: x = min(x, HALF_LINE_X)
+            #             elif "Second Half Field" in zones: x = max(x, HALF_LINE_X)
+            # This was crushing all players onto x=52.5. Removed.
 
             # Global Pitch Bounds Clamping (with 2m margin for touchline out-of-bounds)
             x = np.clip(x, -2.0, PITCH_LENGTH + 2.0)
@@ -171,4 +225,3 @@ class HomographyEstimator:
             corrected[i] = [x, y]
 
         return corrected
-

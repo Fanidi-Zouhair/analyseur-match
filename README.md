@@ -34,3 +34,4 @@ python main.py --video match.mp4 --output annotated_match.mp4
 # Run fast validation test (e.g. 100 frames)
 python main.py --video match.mp4 --max-frames 100
 ```
+
